@@ -706,9 +706,96 @@ export function formatInstallGuide(
   return lines.join('\n');
 }
 
-interface CliInvocation {
+export interface CliInvocation {
   command: string;
   argsPrefix: string[];
+}
+
+/** The npm package that owns each host CLI, relative to the shim's parent directory. */
+const CLI_PACKAGE_PATH: Record<'claude' | 'codex', string[]> = {
+  claude: ['@anthropic-ai', 'claude-code'],
+  codex: ['@openai', 'codex'],
+};
+
+/** Script entrypoints to try when the package manifest declares no usable `bin`. */
+const FALLBACK_ENTRYPOINT_PARTS: Record<'claude' | 'codex', string[][]> = {
+  claude: [['cli.js'], ['index.js']],
+  codex: [['bin', 'codex.js']],
+};
+
+export interface CliInvocationProbe {
+  command: 'claude' | 'codex';
+  candidates: string[];
+  nodePath: string;
+  exists: (path: string) => boolean;
+  readManifest: (manifestPath: string) => unknown;
+}
+
+function invocationForEntrypoint(entrypoint: string, nodePath: string): CliInvocation {
+  // A package may ship a native binary rather than a script; only a script needs
+  // to be handed to Node.
+  return ['.exe', '.com'].includes(extname(entrypoint).toLowerCase())
+    ? { command: entrypoint, argsPrefix: [] }
+    : { command: nodePath, argsPrefix: [entrypoint] };
+}
+
+function declaredBinEntrypoint(manifest: unknown, binName: string): string | null {
+  if (!manifest || typeof manifest !== 'object') return null;
+  const bin = (manifest as { bin?: unknown }).bin;
+  if (typeof bin === 'string') return bin;
+  if (bin && typeof bin === 'object') {
+    const entry = (bin as Record<string, unknown>)[binName];
+    if (typeof entry === 'string') return entry;
+  }
+  return null;
+}
+
+/**
+ * Decide how to invoke a host CLI from what `where.exe` returned on Windows.
+ *
+ * The package manifest is consulted before any fixed filename, because the
+ * manifest is the one field a package has to keep accurate: npm generates its
+ * own shims from it. Claude Code moved from a bundled `cli.js` to a native
+ * `bin/claude.exe` in 2.1.x, and a hardcoded list of script names silently
+ * stopped matching, which made every Windows install fail with "Neither Claude
+ * Code nor Codex CLI was found on PATH."
+ */
+export function selectCliInvocation(probe: CliInvocationProbe): CliInvocation | null {
+  const native = probe.candidates.find(candidate =>
+    ['.exe', '.com'].includes(extname(candidate).toLowerCase()),
+  );
+  if (native) return { command: native, argsPrefix: [] };
+
+  for (const candidate of probe.candidates) {
+    const packageDir = join(dirname(candidate), 'node_modules', ...CLI_PACKAGE_PATH[probe.command]);
+    const manifestPath = join(packageDir, 'package.json');
+    if (!probe.exists(manifestPath)) continue;
+    let manifest: unknown;
+    try {
+      manifest = probe.readManifest(manifestPath);
+    } catch {
+      continue;
+    }
+    const relative = declaredBinEntrypoint(manifest, probe.command);
+    if (!relative) continue;
+    const entrypoint = join(packageDir, relative);
+    if (probe.exists(entrypoint)) return invocationForEntrypoint(entrypoint, probe.nodePath);
+  }
+
+  // Fallback for a package that ships a usable file but no usable `bin` field:
+  // the script names these hosts have historically used.
+  for (const candidate of probe.candidates) {
+    for (const parts of FALLBACK_ENTRYPOINT_PARTS[probe.command]) {
+      const entrypoint = join(
+        dirname(candidate),
+        'node_modules',
+        ...CLI_PACKAGE_PATH[probe.command],
+        ...parts,
+      );
+      if (probe.exists(entrypoint)) return { command: probe.nodePath, argsPrefix: [entrypoint] };
+    }
+  }
+  return null;
 }
 
 function resolveCliInvocation(command: 'claude' | 'codex'): CliInvocation | null {
@@ -726,25 +813,13 @@ function resolveCliInvocation(command: 'claude' | 'codex'): CliInvocation | null
     return null;
   }
 
-  const native = candidates.find(candidate =>
-    ['.exe', '.com'].includes(extname(candidate).toLowerCase()),
-  );
-  if (native) return { command: native, argsPrefix: [] };
-
-  const packageEntrypoints =
-    command === 'codex'
-      ? [['@openai', 'codex', 'bin', 'codex.js']]
-      : [
-          ['@anthropic-ai', 'claude-code', 'cli.js'],
-          ['@anthropic-ai', 'claude-code', 'index.js'],
-        ];
-  for (const candidate of candidates) {
-    for (const parts of packageEntrypoints) {
-      const entrypoint = join(dirname(candidate), 'node_modules', ...parts);
-      if (existsSync(entrypoint)) return { command: process.execPath, argsPrefix: [entrypoint] };
-    }
-  }
-  return null;
+  return selectCliInvocation({
+    command,
+    candidates,
+    nodePath: process.execPath,
+    exists: existsSync,
+    readManifest: manifestPath => JSON.parse(readFileSync(manifestPath, 'utf8')) as unknown,
+  });
 }
 
 function runCli(

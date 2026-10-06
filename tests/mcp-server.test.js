@@ -64,6 +64,7 @@ import {
   rollbackFailedInstall,
   rollbackMcpRegistration,
   runStatusCommand,
+  selectCliInvocation,
   validateForgetSelection,
 } from '../dist/mcp-server/index.js';
 import { formatHostHookConfig } from '../dist/mcp-server/hooks.js';
@@ -989,6 +990,125 @@ describe('MCP CLI: buildInstallArgs', () => {
     const args = buildInstallArgs({});
     const envPairsStr = args.filter((_, i) => args[i - 1] === '--env').join(' ');
     expect(envPairsStr).toContain('AUDREY_AGENT=claude-code');
+  });
+});
+
+describe('Windows CLI invocation resolution', () => {
+  const prefix = join(tmpdir(), 'audrey-cli-probe');
+  const nodePath = join(prefix, 'node.exe');
+  const claudePackageDir = join(prefix, 'node_modules', '@anthropic-ai', 'claude-code');
+  const codexPackageDir = join(prefix, 'node_modules', '@openai', 'codex');
+
+  function buildProbe({
+    command = 'claude',
+    candidates,
+    files = [],
+    manifests = {},
+    readManifest,
+  } = {}) {
+    const existing = new Set(files);
+    return {
+      command,
+      candidates: candidates ?? [join(prefix, command), join(prefix, `${command}.cmd`)],
+      nodePath,
+      exists: candidate => existing.has(candidate),
+      readManifest: readManifest ?? (manifestPath => manifests[manifestPath]),
+    };
+  }
+
+  it('resolves the manifest-declared native binary behind npm shims', () => {
+    // Claude Code 2.1.x ships `bin/claude.exe` and no script entrypoint at all,
+    // so the historical `cli.js` / `index.js` probe matched nothing and every
+    // Windows install failed with "Neither Claude Code nor Codex CLI was found
+    // on PATH." The manifest is what npm builds its own shims from, so it is
+    // the layout-independent thing to read.
+    const manifestPath = join(claudePackageDir, 'package.json');
+    const entrypoint = join(claudePackageDir, 'bin', 'claude.exe');
+
+    const invocation = selectCliInvocation(
+      buildProbe({
+        files: [manifestPath, entrypoint],
+        manifests: { [manifestPath]: { bin: { claude: 'bin/claude.exe' } } },
+      }),
+    );
+
+    expect(invocation).toEqual({ command: entrypoint, argsPrefix: [] });
+  });
+
+  it('runs a manifest-declared script entrypoint through Node', () => {
+    const manifestPath = join(claudePackageDir, 'package.json');
+    const entrypoint = join(claudePackageDir, 'cli.js');
+
+    const invocation = selectCliInvocation(
+      buildProbe({
+        files: [manifestPath, entrypoint],
+        manifests: { [manifestPath]: { bin: { claude: 'cli.js' } } },
+      }),
+    );
+
+    expect(invocation).toEqual({ command: nodePath, argsPrefix: [entrypoint] });
+  });
+
+  it('accepts a manifest that declares bin as a plain string', () => {
+    const manifestPath = join(codexPackageDir, 'package.json');
+    const entrypoint = join(codexPackageDir, 'bin', 'codex.js');
+
+    const invocation = selectCliInvocation(
+      buildProbe({
+        command: 'codex',
+        files: [manifestPath, entrypoint],
+        manifests: { [manifestPath]: { bin: 'bin/codex.js' } },
+      }),
+    );
+
+    expect(invocation).toEqual({ command: nodePath, argsPrefix: [entrypoint] });
+  });
+
+  it('prefers a native candidate without reading any manifest', () => {
+    const native = join(prefix, 'native', 'claude.exe');
+    const readManifest = vi.fn(() => {
+      throw new Error('a native candidate must not consult the manifest');
+    });
+
+    const invocation = selectCliInvocation(
+      buildProbe({ candidates: [native, join(prefix, 'claude')], readManifest }),
+    );
+
+    expect(invocation).toEqual({ command: native, argsPrefix: [] });
+    expect(readManifest).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the historical script names when the manifest cannot be read', () => {
+    const manifestPath = join(claudePackageDir, 'package.json');
+    const cliJs = join(claudePackageDir, 'cli.js');
+
+    const invocation = selectCliInvocation(
+      buildProbe({
+        files: [manifestPath, cliJs],
+        readManifest: () => {
+          throw new Error('EACCES');
+        },
+      }),
+    );
+
+    expect(invocation).toEqual({ command: nodePath, argsPrefix: [cliJs] });
+  });
+
+  it('ignores a manifest whose declared entrypoint is not on disk', () => {
+    const manifestPath = join(claudePackageDir, 'package.json');
+
+    const invocation = selectCliInvocation(
+      buildProbe({
+        files: [manifestPath],
+        manifests: { [manifestPath]: { bin: { claude: 'bin/claude.exe' } } },
+      }),
+    );
+
+    expect(invocation).toBeNull();
+  });
+
+  it('returns null when nothing on PATH resolves to an entrypoint', () => {
+    expect(selectCliInvocation(buildProbe())).toBeNull();
   });
 });
 
